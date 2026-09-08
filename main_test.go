@@ -90,7 +90,7 @@ var logger = log.New(os.Stdout, "", 0)
 
 func stamp() string { return time.Now().Format("15:04:05.000") }
 
-func TestSimulatedLoad(t *testing.T) {
+func TestLoad(t *testing.T) {
 	limiter := NewRateLimiter(loadLimit)
 
 	var allowed, rejected atomic.Int64
@@ -166,11 +166,9 @@ func TestSimulatedLoad(t *testing.T) {
 	logger.Printf("\n%s  finished in %s\n", stamp(), time.Since(start).Round(time.Millisecond))
 	for _, s := range seconds {
 		if allowedPerSecond[s] > loadLimit {
-			t.Errorf("second %s allowed %d calls, want at most %d",
-				time.Unix(s, 0).Format("15:04:05"), allowedPerSecond[s], loadLimit)
+			t.Errorf("second %s allowed %d calls, want at most %d", time.Unix(s, 0).Format("15:04:05"), allowedPerSecond[s], loadLimit)
 		}
-		logger.Printf("  %s  allowed %2d  rejected %6d",
-			time.Unix(s, 0).Format("15:04:05"), allowedPerSecond[s], rejectedPerSecond[s])
+		logger.Printf("  %s  allowed %2d  rejected %6d", time.Unix(s, 0).Format("15:04:05"), allowedPerSecond[s], rejectedPerSecond[s])
 	}
 	logger.Printf("\n  total: %d allowed, %d rejected", allowed.Load(), rejected.Load())
 }
