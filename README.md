@@ -19,9 +19,12 @@ question and returns.
 Written in Go. Nothing outside the standard library.
 
 ```bash
-go test -race ./...   # tests, with the race detector on
-go run .              # small demo
+go test -race ./...                        # tests, with the race detector on
+go test -race -v -run TestSimulatedLoad .  # 50 goroutines hammering one limiter, with a live log
 ```
+
+`main.go` is only the rate limiter. The tests, the load simulation and the
+logging all live in `main_test.go`.
 
 ## How I made it safe for concurrent callers
 
