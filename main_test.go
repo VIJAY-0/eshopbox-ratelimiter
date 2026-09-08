@@ -36,8 +36,6 @@ func TestResetsNextSecond(t *testing.T) {
 	}
 }
 
-// The main requirement: many goroutines calling at once must never push the
-// number of allowed calls above the limit. Run with -race.
 func TestConcurrentNeverExceedsLimit(t *testing.T) {
 	const (
 		limit      = 100
@@ -65,7 +63,6 @@ func TestConcurrentNeverExceedsLimit(t *testing.T) {
 	}
 	wg.Wait()
 
-	// 10000 attempts for 100 slots, all inside a second or two.
 	if allowed > limit*2 {
 		t.Fatalf("allowed %d calls, which is more than the limit of %d per second", allowed, limit)
 	}
