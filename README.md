@@ -18,13 +18,57 @@ question and returns.
 
 Written in Go. Nothing outside the standard library.
 
+## Files
+
+There are only two. `main.go` is the rate limiter and nothing else, about
+thirty lines. Everything else, the tests and the load simulation and all the
+logging, is in `main_test.go`.
+
+## Running it
+
 ```bash
-go test -race ./...     # all tests, with the race detector on
-go test -v -run Load    # 50 goroutines hammering one limiter, with a live log
+go test -race ./...     # all the tests, with the race detector on
+go test -v -run Load    # the load simulation, with a live log
 ```
 
-`main.go` is only the rate limiter. The tests, the load simulation and the
-logging all live in `main_test.go`.
+The load run needs `-v`, because `go test` throws away anything a passing test
+prints unless you ask for it. And if you run the same thing twice in a row Go
+will replay a cached result instead of running it again, so add `-count=1` when
+you want it to actually go.
+
+## What the tests do
+
+Three of them are the plain correctness checks: N calls get through and the
+next one doesn't, the counter resets when the second rolls over, and the
+concurrency one, which throws 200 goroutines at a single limiter with 50 calls
+each. That's 10,000 attempts fighting over 100 slots. If the whole run lands
+inside one clock second it checks that exactly 100 got through, not roughly 100.
+I sanity-checked that test by deleting the lock from a copy of the code, and it
+failed there (it let 102 through), so the test is actually testing what I think
+it's testing.
+
+`TestLoad` is the one worth watching. It runs 50 workers against a limit of 10
+per second for three seconds, logs every call that gets allowed, and fails if
+any second ever goes above the limit. Rejections aren't logged one by one,
+there are about 130,000 of them and they'd bury everything, so they get counted
+and summarised every 500ms instead:
+
+```
+23:23:56.000  worker 14  ALLOWED  1/10 for this second
+23:23:56.000  worker 02  ALLOWED  2/10 for this second
+...
+23:23:56.482  [summary] allowed=20 rejected=21760 (+21760 rejected in last 500ms)
+
+  23:23:56  allowed 10  rejected  43174
+  23:23:57  allowed 10  rejected  43615
+  23:23:58  allowed 10  rejected  37571
+
+  total: 40 allowed, 130462 rejected
+```
+
+The timestamps are the interesting part. The ten allowed calls all land in the
+same millisecond right after each second ticks over, and then nothing gets
+through until the next one.
 
 ## How I made it safe for concurrent callers
 
@@ -44,13 +88,6 @@ section at a time, so every thread sees a counter that nobody else is halfway
 through changing, and the increment always follows from the value that same
 thread just read. Nothing anywhere else touches the counter, so there's no way
 to read or write it outside the lock.
-
-The concurrency test throws 200 goroutines at one limiter, 50 calls each, so
-10,000 attempts fighting over 100 slots. If the whole run lands inside one
-clock second it checks that exactly 100 got through, not "roughly 100". I
-sanity-checked the test by deleting the lock from a copy of the code, and it
-fails there (it let 102 through), so the test is actually testing what I think
-it's testing.
 
 ## What I wasn't sure about
 
