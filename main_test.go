@@ -47,6 +47,7 @@ func TestConcurrentNeverExceedsLimit(t *testing.T) {
 	var mu sync.Mutex
 	allowed := 0
 
+	startSecond := time.Now().Unix()
 	var wg sync.WaitGroup
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
@@ -63,7 +64,11 @@ func TestConcurrentNeverExceedsLimit(t *testing.T) {
 	}
 	wg.Wait()
 
-	if allowed > limit*2 {
-		t.Fatalf("allowed %d calls, which is more than the limit of %d per second", allowed, limit)
+	if time.Now().Unix() == startSecond {
+		if allowed != limit {
+			t.Fatalf("allowed %d calls within one second, want exactly %d", allowed, limit)
+		}
+	} else if allowed > limit*2 {
+		t.Fatalf("allowed %d calls across two seconds, want at most %d", allowed, limit*2)
 	}
 }
