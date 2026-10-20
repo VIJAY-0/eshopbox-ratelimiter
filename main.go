@@ -17,11 +17,10 @@ func NewRateLimiter(limit int) *RateLimiter {
 }
 
 func (r *RateLimiter) AllowRequest() bool {
-	now := time.Now().Unix()
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	now := time.Now().Unix()
 	if now != r.second {
 		r.second = now
 		r.count = 0
