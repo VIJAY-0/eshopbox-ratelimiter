@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"reflect"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -22,17 +24,26 @@ const (
 // The whole check-and-increment runs inside Redis, so concurrent instances
 // cannot both see room for the last slot. TIME comes from the Redis server,
 // which keeps all instances on the same window despite host clock skew.
+// ARGV[3] is a per-call token: a retry after an ambiguous failure within the
+// same window returns the original decision without consuming another slot.
 const redisAllowScript = `
 redis.replicate_commands()
 local t = redis.call('TIME')
-local count = redis.call('HINCRBY', KEYS[1], t[1], 1)
-if count == 1 then
-	redis.call('PEXPIRE', KEYS[1], ARGV[1])
-end
-if count <= tonumber(ARGV[2]) then
+local countField = 'count:' .. t[1]
+local tokenField = 'token:' .. t[1] .. ':' .. ARGV[3]
+if redis.call('HEXISTS', KEYS[1], tokenField) == 1 then
 	return 1
 end
-return 0
+local count = tonumber(redis.call('HGET', KEYS[1], countField) or '0')
+if count >= tonumber(ARGV[2]) then
+	return 0
+end
+redis.call('HINCRBY', KEYS[1], countField, 1)
+redis.call('HSET', KEYS[1], tokenField, 1)
+if count == 0 then
+	redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return 1
 `
 
 // FailurePolicy decides what Allow returns when Redis cannot be reached.
@@ -74,13 +85,47 @@ type redisEvaler interface {
 	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
 }
 
-// NewRedisLimiter returns a limiter backed by client. It returns an error if
-// the configuration is invalid or the client is nil.
+// NewRedisLimiter returns a limiter backed by client.
+//
+// A *redis.Client or *redis.ClusterClient must set ContextTimeoutEnabled so
+// per-attempt deadlines cancel in-flight commands. Other UniversalClient
+// implementations are accepted; the limiter still bounds each attempt itself.
 func NewRedisLimiter(client redis.UniversalClient, cfg RedisLimiterConfig) (*RedisLimiter, error) {
-	if client == nil {
+	if isNilClient(client) {
 		return nil, errors.New("ratelimiter: nil redis client")
 	}
+	if err := checkContextTimeout(client); err != nil {
+		return nil, err
+	}
 	return newRedisLimiter(client, cfg)
+}
+
+func isNilClient(client redis.UniversalClient) bool {
+	if client == nil {
+		return true
+	}
+	value := reflect.ValueOf(client)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return value.IsNil()
+	}
+	return false
+}
+
+func checkContextTimeout(client redis.UniversalClient) error {
+	var enabled bool
+	switch c := client.(type) {
+	case *redis.Client:
+		enabled = c.Options().ContextTimeoutEnabled
+	case *redis.ClusterClient:
+		enabled = c.Options().ContextTimeoutEnabled
+	default:
+		return nil
+	}
+	if !enabled {
+		return errors.New("ratelimiter: redis client must set ContextTimeoutEnabled to enforce per-attempt timeouts")
+	}
+	return nil
 }
 
 func newRedisLimiter(eval redisEvaler, cfg RedisLimiterConfig) (*RedisLimiter, error) {
@@ -140,9 +185,10 @@ func (l *RedisLimiter) Allow(ctx context.Context) (bool, error) {
 		return l.onFailure(err)
 	}
 
+	token := newRequestToken()
 	var lastErr error
 	for attempt := 1; attempt <= l.maxAttempts; attempt++ {
-		allowed, err := l.attempt(ctx)
+		allowed, err := l.attempt(ctx, token)
 		if err == nil {
 			return allowed, nil
 		}
@@ -158,15 +204,37 @@ func (l *RedisLimiter) Allow(ctx context.Context) (bool, error) {
 	return l.onFailure(lastErr)
 }
 
-func (l *RedisLimiter) attempt(parent context.Context) (bool, error) {
+type evalResult struct {
+	n   int
+	err error
+}
+
+func (l *RedisLimiter) attempt(parent context.Context, token string) (bool, error) {
 	ctx, cancel := context.WithTimeout(parent, l.timeout)
 	defer cancel()
 
-	n, err := l.eval.Eval(ctx, redisAllowScript, []string{l.key}, redisWindowTTL.Milliseconds(), l.limit).Int()
-	if err != nil {
-		return false, err
+	// The deadline is enforced here as well: a go-redis client with
+	// ContextTimeoutEnabled left at its default false ignores context deadlines.
+	results := make(chan evalResult, 1)
+	go func() {
+		n, err := l.eval.Eval(ctx, redisAllowScript, []string{l.key}, redisWindowTTL.Milliseconds(), l.limit, token).Int()
+		results <- evalResult{n: n, err: err}
+	}()
+
+	select {
+	case result := <-results:
+		if result.err != nil {
+			return false, result.err
+		}
+		return result.n == 1, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
 	}
-	return n == 1, nil
+}
+
+// Request tokens only need to be unique, not unguessable.
+func newRequestToken() string {
+	return strconv.FormatUint(rand.Uint64(), 16) + strconv.FormatUint(rand.Uint64(), 16)
 }
 
 func (l *RedisLimiter) onFailure(err error) (bool, error) {

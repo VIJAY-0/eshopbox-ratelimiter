@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"math"
+	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,9 +21,23 @@ func newFrozenRedis(t *testing.T) (*miniredis.Miniredis, *redis.Client) {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	mr.SetTime(frozenRedisTime)
-	client := redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: -1})
+	client := redis.NewClient(&redis.Options{
+		Addr:                  mr.Addr(),
+		MaxRetries:            -1,
+		ContextTimeoutEnabled: true,
+	})
 	t.Cleanup(func() { _ = client.Close() })
 	return mr, client
+}
+
+func windowCount(t *testing.T, client *redis.Client, key string) int {
+	t.Helper()
+	field := "count:" + strconv.FormatInt(frozenRedisTime.Unix(), 10)
+	count, err := client.HGet(context.Background(), key, field).Int()
+	if err != nil {
+		t.Fatalf("HGet %s %s: %v", key, field, err)
+	}
+	return count
 }
 
 func testLimiter(t *testing.T, eval redisEvaler, cfg RedisLimiterConfig) *RedisLimiter {
@@ -79,6 +95,26 @@ func (f *fakeEvaler) Eval(ctx context.Context, script string, keys []string, arg
 	return f.next.Eval(ctx, script, keys, args...)
 }
 
+type lossyEvaler struct {
+	next   redisEvaler
+	losses atomic.Int64
+	calls  atomic.Int64
+}
+
+// Eval runs the real script, then loses the reply for the configured number
+// of calls, imitating a failure where Redis applied the write but the client
+// never saw the answer.
+func (f *lossyEvaler) Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd {
+	f.calls.Add(1)
+	cmd := f.next.Eval(ctx, script, keys, args...)
+	if f.losses.Add(-1) >= 0 {
+		lost := redis.NewCmd(ctx)
+		lost.SetErr(errors.New("reply lost after the script ran"))
+		return lost
+	}
+	return cmd
+}
+
 func TestRedisLimiterSharesBudgetAcrossInstances(t *testing.T) {
 	mr, _ := newFrozenRedis(t)
 	const (
@@ -89,9 +125,17 @@ func TestRedisLimiterSharesBudgetAcrossInstances(t *testing.T) {
 
 	limiters := make([]*RedisLimiter, instances)
 	for i := range limiters {
-		client := redis.NewClient(&redis.Options{Addr: mr.Addr(), MaxRetries: -1})
+		client := redis.NewClient(&redis.Options{
+			Addr:                  mr.Addr(),
+			MaxRetries:            -1,
+			ContextTimeoutEnabled: true,
+		})
 		t.Cleanup(func() { _ = client.Close() })
-		limiters[i] = testLimiter(t, client, RedisLimiterConfig{Limit: limit, Key: "shared-budget"})
+		limiters[i] = testLimiter(t, client, RedisLimiterConfig{
+			Limit:   limit,
+			Key:     "shared-budget",
+			Timeout: 2 * time.Second,
+		})
 	}
 
 	var allowed atomic.Int64
@@ -167,6 +211,47 @@ func TestRedisLimiterRetriesTransientFailures(t *testing.T) {
 	allowOnce(t, l, true)
 	if calls := fault.calls.Load(); calls != 3 {
 		t.Fatalf("Eval called %d times, want 3", calls)
+	}
+}
+
+func TestRedisLimiterRetriesDoNotConsumeExtraBudget(t *testing.T) {
+	_, client := newFrozenRedis(t)
+	key := "idempotent-retry"
+	fault := &lossyEvaler{next: client}
+	fault.losses.Store(1)
+	l := testLimiter(t, fault, RedisLimiterConfig{
+		Limit:       5,
+		Key:         key,
+		Timeout:     100 * time.Millisecond,
+		MaxAttempts: 3,
+		Backoff:     time.Millisecond,
+	})
+
+	allowOnce(t, l, true)
+	if calls := fault.calls.Load(); calls != 2 {
+		t.Fatalf("Eval called %d times, want 2", calls)
+	}
+	if count := windowCount(t, client, key); count != 1 {
+		t.Fatalf("window count = %d after one allowed call with a lost reply, want 1", count)
+	}
+
+	for i := 0; i < 4; i++ {
+		allowOnce(t, l, true)
+	}
+	allowOnce(t, l, false)
+}
+
+func TestRedisLimiterDeniedRequestsDoNotConsumeBudget(t *testing.T) {
+	_, client := newFrozenRedis(t)
+	key := "denied"
+	l := testLimiter(t, client, RedisLimiterConfig{Limit: 1, Key: key})
+
+	allowOnce(t, l, true)
+	allowOnce(t, l, false)
+	allowOnce(t, l, false)
+
+	if count := windowCount(t, client, key); count != 1 {
+		t.Fatalf("window count = %d after one allowed and two denied calls, want 1", count)
 	}
 }
 
@@ -280,6 +365,62 @@ func TestRedisLimiterAppliesPerAttemptTimeout(t *testing.T) {
 	}
 }
 
+func TestRedisLimiterEnforcesTimeoutWithoutClientSupport(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	})
+
+	// ContextTimeoutEnabled is false here, as it is by default. The limiter
+	// must still bound the attempt.
+	client := redis.NewClient(&redis.Options{Addr: ln.Addr().String(), MaxRetries: -1})
+	t.Cleanup(func() { _ = client.Close() })
+	l := testLimiter(t, client, RedisLimiterConfig{
+		Limit:       1,
+		Timeout:     25 * time.Millisecond,
+		MaxAttempts: 1,
+		Backoff:     time.Millisecond,
+	})
+
+	start := time.Now()
+	allowed, err := l.Allow(context.Background())
+	elapsed := time.Since(start)
+
+	if allowed {
+		t.Fatal("Allow = true against an unresponsive Redis, want false")
+	}
+	if err == nil {
+		t.Fatal("Allow returned nil error, want a timeout error")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Allow took %s with a 25ms timeout, want under 1s", elapsed)
+	}
+}
+
 func TestRedisLimiterConfigValidation(t *testing.T) {
 	_, client := newFrozenRedis(t)
 
@@ -329,5 +470,20 @@ func TestRedisLimiterConfigValidation(t *testing.T) {
 
 	if _, err := NewRedisLimiter(nil, RedisLimiterConfig{Limit: 1}); err == nil {
 		t.Fatal("NewRedisLimiter with a nil client succeeded, want error")
+	}
+}
+
+func TestNewRedisLimiterRejectsClientsItCannotBound(t *testing.T) {
+	mr := miniredis.RunT(t)
+
+	plain := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = plain.Close() })
+	if _, err := NewRedisLimiter(plain, RedisLimiterConfig{Limit: 1}); err == nil {
+		t.Fatal("NewRedisLimiter accepted a client without ContextTimeoutEnabled, want error")
+	}
+
+	var typedNil *redis.Client
+	if _, err := NewRedisLimiter(typedNil, RedisLimiterConfig{Limit: 1}); err == nil {
+		t.Fatal("NewRedisLimiter accepted a typed nil client, want error")
 	}
 }

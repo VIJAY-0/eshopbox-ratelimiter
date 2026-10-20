@@ -20,7 +20,10 @@ question and returns.
 The shared version:
 
 ```go
-client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+client := redis.NewClient(&redis.Options{
+    Addr:                  "localhost:6379",
+    ContextTimeoutEnabled: true,
+})
 limiter, err := NewRedisLimiter(client, RedisLimiterConfig{
     Limit:  100,
     Key:    "sales-channel",
@@ -32,6 +35,12 @@ if err != nil {
     // Redis couldn't be reached; allowed reflects the failure policy.
 }
 ```
+
+`ContextTimeoutEnabled` is required for a `*redis.Client` or
+`*redis.ClusterClient`. Without it go-redis ignores context deadlines, so a
+Redis that accepts the connection but never answers would hold an attempt until
+the client's own I/O timeout. `NewRedisLimiter` refuses such a client instead of
+silently weakening the per-attempt timeout.
 
 Every process using the same Redis and the same `Key` shares one budget of
 `Limit` calls per second. A nil error means Redis answered: `false` is a normal
@@ -99,9 +108,12 @@ The shared limiter's tests freeze the Redis clock and run four independent
 clients against one key. 160 concurrent calls fight over 100 slots and exactly
 100 get through, which is the property the local limiter can't provide. The
 rest cover the window rolling over, key expiry, a transient Redis failure that
-clears on retry, both failure policies after the retries are exhausted, the
-per-attempt timeout, context cancellation, and config validation. None of it
-touches a real Redis server, so it stays fast and deterministic in CI.
+clears on retry, a lost reply that must not double-charge the budget, denied
+calls not consuming budget, both failure policies after the retries are
+exhausted, the per-attempt timeout, a client that ignores context deadlines,
+context cancellation, typed-nil and unsafe-client rejection, and config
+validation. None of it touches a real Redis server, so it stays fast and
+deterministic in CI.
 
 ## How the shared limiter stays correct
 
@@ -120,6 +132,14 @@ well: no derived keys, no cross-slot access. The TTL is longer than one window
 so the hash survives its own window, and old fields disappear when the hash
 expires.
 
+The script is also idempotent within a window. `Allow` makes one random token
+per call and passes it through every retry. If an attempt reached Redis and ran
+but the reply was lost on the way back, the retry sees the token in the hash and
+returns the same decision without incrementing again. A denied request stores
+nothing and increments nothing, so a retry after an ambiguous denial cannot
+consume a slot either. Without the token, retrying a write that may have
+already happened would double-charge the budget.
+
 ## When Redis is unavailable
 
 The shared limiter is now on the request path, so its failure mode is part of
@@ -137,6 +157,14 @@ Either way `Allow` returns the underlying error, so the caller can log it or
 count it instead of guessing why a decision was made. A caller whose context is
 already canceled is not retried at all, and cancellation during a backoff stops
 the retries immediately.
+
+Each attempt is bounded twice. The deadline is handed to the client so it can
+abort the in-flight command, and the limiter also stops waiting when the
+deadline expires. That second bound matters for clients that ignore context
+deadlines: a blackholed connection or an overloaded network cannot stretch one
+attempt past `Timeout`. A command that was already in flight when the limiter
+gave up carries the request token, so its retry does not consume a second slot
+in the same window.
 
 ## How I made the local limiter safe for concurrent callers
 

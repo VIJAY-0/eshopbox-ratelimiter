@@ -21,7 +21,7 @@ func TestLiveRedisLimiterSharedBudget(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	opts := &redis.Options{Addr: addr, MaxRetries: -1}
+	opts := &redis.Options{Addr: addr, MaxRetries: -1, ContextTimeoutEnabled: true}
 	if password := os.Getenv("REDIS_PASSWORD"); password != "" {
 		opts.Password = password
 	}
