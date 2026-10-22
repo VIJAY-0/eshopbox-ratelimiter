@@ -18,32 +18,45 @@ const (
 	defaultRedisMaxAttempts = 3
 	defaultRedisBackoff     = 10 * time.Millisecond
 	maxRedisBackoff         = time.Second
-	redisWindowTTL          = 2 * time.Second
+	redisTokenTTL           = 2 * time.Second
+	redisKeyTTL             = redisTokenTTL + time.Second
 )
 
 // The whole check-and-increment runs inside Redis, so concurrent instances
 // cannot both see room for the last slot. TIME comes from the Redis server,
 // which keeps all instances on the same window despite host clock skew.
+//
+// The key is a sorted set with one member per allowed call: the member is a
+// per-call token and the score is the microsecond it was allowed. Counting the
+// current window is a ZCOUNT, and keeping tokens as members makes the retry
+// idempotency check a single ZSCORE. Members older than the token TTL are
+// trimmed on every allow, so the set is bounded by a few windows' worth of
+// requests instead of growing with total traffic.
+//
 // ARGV[3] is a per-call token: a retry after an ambiguous failure within the
-// same window returns the original decision without consuming another slot.
+// token TTL returns the original decision without consuming another slot.
+// ARGV[1] is the token TTL in microseconds, ARGV[2] the limit and ARGV[4] the
+// key TTL in milliseconds.
 const redisAllowScript = `
 redis.replicate_commands()
 local t = redis.call('TIME')
-local countField = 'count:' .. t[1]
-local tokenField = 'token:' .. t[1] .. ':' .. ARGV[3]
-if redis.call('HEXISTS', KEYS[1], tokenField) == 1 then
-	return 1
+local now = tonumber(t[1]) * 1000000 + tonumber(t[2])
+local startUs = tonumber(t[1]) * 1000000
+local endUs = startUs + 1000000
+local limit = tonumber(ARGV[2])
+local tokenField = 't:' .. ARGV[3]
+if redis.call('ZSCORE', KEYS[1], tokenField) then
+	local count = redis.call('ZCOUNT', KEYS[1], startUs, endUs - 1)
+	return {1, limit - count, 0}
 end
-local count = tonumber(redis.call('HGET', KEYS[1], countField) or '0')
-if count >= tonumber(ARGV[2]) then
-	return 0
+local count = redis.call('ZCOUNT', KEYS[1], startUs, endUs - 1)
+if count >= limit then
+	return {0, 0, endUs - now}
 end
-redis.call('HINCRBY', KEYS[1], countField, 1)
-redis.call('HSET', KEYS[1], tokenField, 1)
-if count == 0 then
-	redis.call('PEXPIRE', KEYS[1], ARGV[1])
-end
-return 1
+redis.call('ZADD', KEYS[1], now, tokenField)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - tonumber(ARGV[1]))
+redis.call('PEXPIRE', KEYS[1], ARGV[4])
+return {1, limit - count - 1, 0}
 `
 
 // FailurePolicy decides what Allow returns when Redis cannot be reached.
@@ -175,12 +188,14 @@ func normalizeRedisConfig(cfg RedisLimiterConfig) (RedisLimiterConfig, error) {
 	return cfg, nil
 }
 
-// Allow reports whether a request may proceed.
+// Decide reports whether a request may proceed and, when denied, how long to
+// wait before retrying.
 //
-// A nil error means Redis answered: true is an allowed request and false is a
-// normal rate-limit denial. A non-nil error means Redis could not be reached
-// within the retry budget; the boolean then reflects the configured policy.
-func (l *RedisLimiter) Allow(ctx context.Context) (bool, error) {
+// A nil error means Redis answered: Allowed is the normal rate-limit decision
+// and the rest of the Decision describes the budget. A non-nil error means
+// Redis could not be reached within the retry budget; Allowed then reflects
+// the configured policy and the other fields are not meaningful.
+func (l *RedisLimiter) Decide(ctx context.Context) (Decision, error) {
 	if err := ctx.Err(); err != nil {
 		return l.onFailure(err)
 	}
@@ -188,9 +203,9 @@ func (l *RedisLimiter) Allow(ctx context.Context) (bool, error) {
 	token := newRequestToken()
 	var lastErr error
 	for attempt := 1; attempt <= l.maxAttempts; attempt++ {
-		allowed, err := l.attempt(ctx, token)
+		decision, err := l.attempt(ctx, token)
 		if err == nil {
-			return allowed, nil
+			return decision, nil
 		}
 		lastErr = err
 		if attempt == l.maxAttempts || ctx.Err() != nil {
@@ -204,12 +219,19 @@ func (l *RedisLimiter) Allow(ctx context.Context) (bool, error) {
 	return l.onFailure(lastErr)
 }
 
-type evalResult struct {
-	n   int
-	err error
+// Allow reports whether a request may proceed. It is a shorthand for
+// Decide(ctx).Allowed and has the same error semantics.
+func (l *RedisLimiter) Allow(ctx context.Context) (bool, error) {
+	decision, err := l.Decide(ctx)
+	return decision.Allowed, err
 }
 
-func (l *RedisLimiter) attempt(parent context.Context, token string) (bool, error) {
+type evalResult struct {
+	decision Decision
+	err      error
+}
+
+func (l *RedisLimiter) attempt(parent context.Context, token string) (Decision, error) {
 	ctx, cancel := context.WithTimeout(parent, l.timeout)
 	defer cancel()
 
@@ -217,19 +239,34 @@ func (l *RedisLimiter) attempt(parent context.Context, token string) (bool, erro
 	// ContextTimeoutEnabled left at its default false ignores context deadlines.
 	results := make(chan evalResult, 1)
 	go func() {
-		n, err := l.eval.Eval(ctx, redisAllowScript, []string{l.key}, redisWindowTTL.Milliseconds(), l.limit, token).Int()
-		results <- evalResult{n: n, err: err}
+		nums, err := l.eval.Eval(ctx, redisAllowScript, []string{l.key},
+			redisTokenTTL.Microseconds(), l.limit, token, redisKeyTTL.Milliseconds()).Int64Slice()
+		if err != nil {
+			results <- evalResult{err: err}
+			return
+		}
+		decision, err := decisionFromReply(nums, l.limit)
+		results <- evalResult{decision: decision, err: err}
 	}()
 
 	select {
 	case result := <-results:
-		if result.err != nil {
-			return false, result.err
-		}
-		return result.n == 1, nil
+		return result.decision, result.err
 	case <-ctx.Done():
-		return false, ctx.Err()
+		return Decision{Limit: l.limit}, ctx.Err()
 	}
+}
+
+func decisionFromReply(nums []int64, limit int) (Decision, error) {
+	if len(nums) != 3 {
+		return Decision{}, fmt.Errorf("ratelimiter: unexpected script reply length %d", len(nums))
+	}
+	return Decision{
+		Allowed:    nums[0] == 1,
+		Limit:      limit,
+		Remaining:  int(nums[1]),
+		RetryAfter: time.Duration(nums[2]) * time.Microsecond,
+	}, nil
 }
 
 // Request tokens only need to be unique, not unguessable.
@@ -237,9 +274,9 @@ func newRequestToken() string {
 	return strconv.FormatUint(rand.Uint64(), 16) + strconv.FormatUint(rand.Uint64(), 16)
 }
 
-func (l *RedisLimiter) onFailure(err error) (bool, error) {
+func (l *RedisLimiter) onFailure(err error) (Decision, error) {
 	wrapped := fmt.Errorf("ratelimiter: redis limiter unavailable: %w", err)
-	return l.policy == FailOpen, wrapped
+	return Decision{Limit: l.limit, Allowed: l.policy == FailOpen}, wrapped
 }
 
 func (l *RedisLimiter) backoffFor(attempt int) time.Duration {

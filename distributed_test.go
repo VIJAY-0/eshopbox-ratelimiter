@@ -32,12 +32,14 @@ func newFrozenRedis(t *testing.T) (*miniredis.Miniredis, *redis.Client) {
 
 func windowCount(t *testing.T, client *redis.Client, key string) int {
 	t.Helper()
-	field := "count:" + strconv.FormatInt(frozenRedisTime.Unix(), 10)
-	count, err := client.HGet(context.Background(), key, field).Int()
+	start := frozenRedisTime.Unix() * 1_000_000
+	end := start + 1_000_000
+	count, err := client.ZCount(context.Background(), key,
+		strconv.FormatInt(start, 10), strconv.FormatInt(end-1, 10)).Result()
 	if err != nil {
-		t.Fatalf("HGet %s %s: %v", key, field, err)
+		t.Fatalf("ZCount %s: %v", key, err)
 	}
-	return count
+	return int(count)
 }
 
 func testLimiter(t *testing.T, eval redisEvaler, cfg RedisLimiterConfig) *RedisLimiter {
@@ -187,11 +189,11 @@ func TestRedisLimiterExpiresInactiveWindow(t *testing.T) {
 	if !mr.Exists(key) {
 		t.Fatalf("key %q missing after an allowed request", key)
 	}
-	if ttl := mr.TTL(key); ttl <= 0 || ttl > redisWindowTTL {
-		t.Fatalf("TTL = %s, want within (0, %s]", ttl, redisWindowTTL)
+	if ttl := mr.TTL(key); ttl <= 0 || ttl > redisKeyTTL {
+		t.Fatalf("TTL = %s, want within (0, %s]", ttl, redisKeyTTL)
 	}
 
-	mr.FastForward(redisWindowTTL + time.Second)
+	mr.FastForward(redisKeyTTL + time.Second)
 	if mr.Exists(key) {
 		t.Fatalf("key %q still exists after its TTL", key)
 	}
@@ -252,6 +254,55 @@ func TestRedisLimiterDeniedRequestsDoNotConsumeBudget(t *testing.T) {
 
 	if count := windowCount(t, client, key); count != 1 {
 		t.Fatalf("window count = %d after one allowed and two denied calls, want 1", count)
+	}
+}
+
+func TestRedisLimiterDecisionMetadata(t *testing.T) {
+	_, client := newFrozenRedis(t)
+	l := testLimiter(t, client, RedisLimiterConfig{Limit: 3, Key: "metadata"})
+
+	for i, want := range []int{2, 1, 0} {
+		d, err := l.Decide(context.Background())
+		if err != nil {
+			t.Fatalf("Decide call %d: %v", i+1, err)
+		}
+		if !d.Allowed || d.Limit != 3 || d.Remaining != want || d.RetryAfter != 0 {
+			t.Fatalf("Decide call %d = %+v, want allowed with %d remaining", i+1, d, want)
+		}
+	}
+
+	d, err := l.Decide(context.Background())
+	if err != nil {
+		t.Fatalf("Decide over budget: %v", err)
+	}
+	if d.Allowed || d.Limit != 3 || d.Remaining != 0 {
+		t.Fatalf("Decide over budget = %+v, want denied with 0 remaining", d)
+	}
+	if d.RetryAfter != time.Second {
+		t.Fatalf("RetryAfter = %s, want 1s", d.RetryAfter)
+	}
+}
+
+func TestRedisLimiterStateStaysBounded(t *testing.T) {
+	mr, client := newFrozenRedis(t)
+	const limit = 10
+	key := "bounded"
+	l := testLimiter(t, client, RedisLimiterConfig{Limit: limit, Key: key})
+
+	now := frozenRedisTime
+	for second := 0; second < 10; second++ {
+		for i := 0; i < limit; i++ {
+			allowOnce(t, l, true)
+		}
+		allowOnce(t, l, false)
+		now = now.Add(time.Second)
+		mr.SetTime(now)
+	}
+
+	allowOnce(t, l, true) // trims members older than the token TTL
+	card := client.ZCard(context.Background(), key).Val()
+	if maxMembers := int64(3 * limit); card > maxMembers {
+		t.Fatalf("sorted set has %d members after 10 windows, want at most %d", card, maxMembers)
 	}
 }
 
