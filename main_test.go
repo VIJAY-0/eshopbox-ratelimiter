@@ -10,8 +10,32 @@ import (
 	"time"
 )
 
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock(t time.Time) *fakeClock {
+	return &fakeClock{t: t}
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+var testStart = time.Unix(1_700_000_000, 250_000_000)
+
 func TestAllowsUpToLimit(t *testing.T) {
-	r := NewRateLimiter(3)
+	clock := newFakeClock(testStart)
+	r := newRateLimiter(3, FixedWindow, clock.Now)
 
 	for i := 1; i <= 3; i++ {
 		if !r.AllowRequest() {
@@ -23,24 +47,112 @@ func TestAllowsUpToLimit(t *testing.T) {
 	}
 }
 
-func TestResetsNextSecond(t *testing.T) {
-	r := NewRateLimiter(1)
+func TestFixedWindowResetsNextSecond(t *testing.T) {
+	clock := newFakeClock(testStart)
+	r := newRateLimiter(1, FixedWindow, clock.Now)
 
-	if !r.AllowRequest() {
-		t.Fatal("first request was denied")
+	allowLocalOnce(t, r, true)
+	allowLocalOnce(t, r, false)
+
+	clock.Advance(time.Second)
+	allowLocalOnce(t, r, true)
+}
+
+func TestFixedWindowDecisionMetadata(t *testing.T) {
+	clock := newFakeClock(testStart) // 0.25s into the second
+	r := newRateLimiter(3, FixedWindow, clock.Now)
+
+	d := r.Decide()
+	if !d.Allowed || d.Limit != 3 || d.Remaining != 2 || d.RetryAfter != 0 {
+		t.Fatalf("first Decision = %+v, want allowed with 2 remaining", d)
 	}
-	if r.AllowRequest() {
-		t.Fatal("second request in the same second was allowed")
+
+	r.Decide()
+	r.Decide()
+
+	d = r.Decide()
+	if d.Allowed || d.Limit != 3 || d.Remaining != 0 {
+		t.Fatalf("denied Decision = %+v, want denied with 0 remaining", d)
+	}
+	if d.RetryAfter != 750*time.Millisecond {
+		t.Fatalf("RetryAfter = %s, want 750ms", d.RetryAfter)
 	}
 
-	time.Sleep(time.Second)
-
-	if !r.AllowRequest() {
-		t.Fatal("request in the next second was denied")
+	clock.Advance(d.RetryAfter)
+	d = r.Decide()
+	if !d.Allowed || d.Remaining != 2 {
+		t.Fatalf("Decision after retry = %+v, want allowed with 2 remaining", d)
 	}
 }
 
-func TestConcurrentNeverExceedsLimit(t *testing.T) {
+func TestGCRAAllowsBurstThenPaces(t *testing.T) {
+	clock := newFakeClock(testStart)
+	r := newRateLimiter(4, GCRA, clock.Now) // one request every 250ms
+
+	for i, want := range []int{3, 2, 1, 0} {
+		d := r.Decide()
+		if !d.Allowed || d.Remaining != want {
+			t.Fatalf("burst request %d = %+v, want allowed with %d remaining", i+1, d, want)
+		}
+	}
+
+	d := r.Decide()
+	if d.Allowed || d.RetryAfter != 250*time.Millisecond {
+		t.Fatalf("5th request = %+v, want denied with 250ms retry", d)
+	}
+
+	clock.Advance(249 * time.Millisecond)
+	if d = r.Decide(); d.Allowed || d.RetryAfter != time.Millisecond {
+		t.Fatalf("request 1ms early = %+v, want denied with 1ms retry", d)
+	}
+
+	clock.Advance(time.Millisecond)
+	if d = r.Decide(); !d.Allowed || d.Remaining != 0 {
+		t.Fatalf("request on the emission boundary = %+v, want allowed with 0 remaining", d)
+	}
+}
+
+func TestGCRAIdleRefillsBurst(t *testing.T) {
+	clock := newFakeClock(testStart)
+	r := newRateLimiter(4, GCRA, clock.Now)
+
+	for i := 0; i < 4; i++ {
+		allowLocalOnce(t, r, true)
+	}
+	allowLocalOnce(t, r, false)
+
+	clock.Advance(10 * time.Second)
+	for i := 0; i < 4; i++ {
+		allowLocalOnce(t, r, true)
+	}
+	allowLocalOnce(t, r, false)
+}
+
+func TestGCRALimitOne(t *testing.T) {
+	clock := newFakeClock(testStart)
+	r := newRateLimiter(1, GCRA, clock.Now)
+
+	d := r.Decide()
+	if !d.Allowed || d.Remaining != 0 {
+		t.Fatalf("first Decision = %+v, want allowed with 0 remaining", d)
+	}
+
+	d = r.Decide()
+	if d.Allowed || d.RetryAfter != time.Second {
+		t.Fatalf("second Decision = %+v, want denied with 1s retry", d)
+	}
+
+	clock.Advance(999 * time.Millisecond)
+	if d = r.Decide(); d.Allowed || d.RetryAfter != time.Millisecond {
+		t.Fatalf("Decision 1ms early = %+v, want denied with 1ms retry", d)
+	}
+
+	clock.Advance(time.Millisecond)
+	allowLocalOnce(t, r, true)
+	allowLocalOnce(t, r, false)
+}
+
+func TestConcurrentFixedNeverExceedsLimit(t *testing.T) {
 	const (
 		limit      = 100
 		goroutines = 200
@@ -73,6 +185,64 @@ func TestConcurrentNeverExceedsLimit(t *testing.T) {
 	} else if got > limit*2 {
 		// Crossed a second boundary, so up to two windows may have opened.
 		t.Fatalf("allowed %d calls across two seconds, want at most %d", got, limit*2)
+	}
+}
+
+func TestConcurrentGCRAExactlyLimit(t *testing.T) {
+	const (
+		limit      = 100
+		goroutines = 200
+		perRoutine = 50
+	)
+	clock := newFakeClock(testStart)
+	r := newRateLimiter(limit, GCRA, clock.Now)
+
+	var allowed atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perRoutine; j++ {
+				if r.AllowRequest() {
+					allowed.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := allowed.Load(); got != limit {
+		t.Fatalf("allowed %d calls at one instant, want exactly %d", got, limit)
+	}
+}
+
+func TestRateLimiterRejectsNonPositiveLimit(t *testing.T) {
+	tests := []struct {
+		name string
+		new  func()
+	}{
+		{"fixed zero", func() { NewRateLimiter(0) }},
+		{"fixed negative", func() { NewRateLimiter(-1) }},
+		{"gcra zero", func() { NewGCRARateLimiter(0) }},
+		{"gcra negative", func() { NewGCRARateLimiter(-1) }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("constructor did not panic")
+				}
+			}()
+			tc.new()
+		})
+	}
+}
+
+func allowLocalOnce(t *testing.T, r *RateLimiter, want bool) {
+	t.Helper()
+	if got := r.AllowRequest(); got != want {
+		t.Fatalf("AllowRequest = %v, want %v", got, want)
 	}
 }
 
